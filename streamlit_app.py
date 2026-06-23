@@ -1,21 +1,3 @@
-"""
-streamlit_app.py
-================
-Interactive Streamlit UI for the pure-numpy Eigenfaces (PCA/SVD) library.
-
-Run from inside the eigenfaces/ folder:
-    streamlit run streamlit_app.py
-
-The app imports the shared `eigenfaces_core` module (same directory) and
-exposes 6 tabs: Dataset, Training, Visualisasi, Identifikasi, Verifikasi,
-Evaluasi. All heavy work is done by eigenfaces_core; this file is purely
-presentation + caching + memory hygiene.
-
-Pure PCA / SVD only - NO face_recognition / sklearn.decomposition / dlib /
-MTCNN / Facenet / opencv_face. Allowed: numpy, matplotlib, PIL/cv2 I/O,
-psutil (optional).
-"""
-
 # --------------------------------------------------------------------------- #
 # Imports
 # --------------------------------------------------------------------------- #
