@@ -385,6 +385,19 @@ def render_sidebar() -> dict:
         )
 
         st.markdown("---")
+        st.markdown("### Data Split & Preprocessing")
+        train_ratio = st.slider(
+            "Rasio Data Training",
+            min_value=0.50, max_value=0.95, step=0.05, value=0.80,
+            help="Bagi dataset menjadi train/test secara proporsional per identitas.",
+        )
+        hist_eq = st.checkbox(
+            "Histogram Equalization",
+            value=False,
+            help="Standardisasi pencahayaan menggunakan histogram equalization + z-score normalization.",
+        )
+
+        st.markdown("---")
         st.markdown("### Memory")
         ram_mb = ec.mem_used_mb() if ec.has_psutil() else -1.0
         if ram_mb >= 0:
@@ -418,6 +431,8 @@ def render_sidebar() -> dict:
         metric=metric,
         factor=factor,
         n_components_override=int(n_components_override),
+        train_ratio=train_ratio,
+        hist_eq=hist_eq,
         ram_mb=ram_mb,
     )
 
@@ -431,6 +446,7 @@ def tab_dataset(params: dict) -> None:
     st.markdown(
         '<div class="ef-card"><h3>Sumber dataset</h3>'
         '<p class="ef-muted">Unggah ZIP berisi subfolder per identitas, atau '
+        'unggah langsung file gambar (bisa banyak sekaligus), atau '
         'masukkan path folder lokal. Struktur yang didukung: '
         '<span class="ef-mono">root/s1/*.pgm</span>, '
         '<span class="ef-mono">root/identity_name/*.jpg</span>, atau flat.</p>'
@@ -440,11 +456,11 @@ def tab_dataset(params: dict) -> None:
 
     col_up, col_path = st.columns(2)
     with col_up:
-        uploaded_zip = st.file_uploader(
-            "Unggah ZIP dataset",
-            accept_multiple_files=False,
-            type=["zip"],
-            key="zip_uploader",
+        uploaded_files = st.file_uploader(
+            "Unggah ZIP atau gambar (bisa banyak)",
+            accept_multiple_files=True,
+            type=["zip", "png", "jpg", "jpeg", "bmp", "pgm"],
+            key="dataset_uploader",
         )
     with col_path:
         local_path = st.text_input(
@@ -455,21 +471,43 @@ def tab_dataset(params: dict) -> None:
 
     # Resolve dataset folder
     dataset_folder: Optional[str] = None
-    if uploaded_zip is not None:
-        try:
-            tmp_dir = tempfile.mkdtemp(prefix="eigenfaces_zip_")
-            zip_path = os.path.join(tmp_dir, uploaded_zip.name)
-            with open(zip_path, "wb") as f:
-                f.write(uploaded_zip.getbuffer())
-            with zipfile.ZipFile(zip_path, "r") as z:
-                z.extractall(tmp_dir)
-            # Find the directory containing images (skip top-level if it's a wrapper)
-            dataset_folder = ec.detect_dataset(tmp_dir, interactive=False)
-            st.session_state["dataset_folder"] = dataset_folder
-            st.session_state["dataset_tmp_dir"] = tmp_dir
-            st.success(f"ZIP diekstrak ke: `{tmp_dir}`\n\nDataset terdeteksi: `{dataset_folder}`")
-        except Exception as e:
-            st.error(f"Gagal ekstrak ZIP: {e}")
+    if uploaded_files:
+        # Pisahkan ZIP dan gambar
+        zip_files = [f for f in uploaded_files if f.name.lower().endswith('.zip')]
+        image_files = [f for f in uploaded_files if not f.name.lower().endswith('.zip')]
+
+        if zip_files:
+            uploaded_zip = zip_files[0]
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="eigenfaces_zip_")
+                zip_path = os.path.join(tmp_dir, uploaded_zip.name)
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_zip.getbuffer())
+                with zipfile.ZipFile(zip_path, "r") as z:
+                    z.extractall(tmp_dir)
+                dataset_folder = ec.detect_dataset(tmp_dir, interactive=False)
+                st.session_state["dataset_folder"] = dataset_folder
+                st.session_state["dataset_tmp_dir"] = tmp_dir
+                st.success(f"ZIP diekstrak ke: `{tmp_dir}`\n\nDataset terdeteksi: `{dataset_folder}`")
+            except Exception as e:
+                st.error(f"Gagal ekstrak ZIP: {e}")
+
+        if image_files:
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="eigenfaces_imgs_")
+                # Buat struktur folder: tmp_dir/images/
+                img_dir = os.path.join(tmp_dir, "images")
+                os.makedirs(img_dir, exist_ok=True)
+                for uploaded in image_files:
+                    file_path = os.path.join(img_dir, uploaded.name)
+                    with open(file_path, "wb") as f:
+                        f.write(uploaded.getbuffer())
+                dataset_folder = img_dir
+                st.session_state["dataset_folder"] = dataset_folder
+                st.session_state["dataset_tmp_dir"] = tmp_dir
+                st.success(f"{len(image_files)} gambar disimpan ke: `{img_dir}`")
+            except Exception as e:
+                st.error(f"Gagal menyimpan gambar: {e}")
     elif local_path.strip():
         try:
             dataset_folder = ec.detect_dataset(local_path.strip(), interactive=False)
@@ -576,6 +614,8 @@ def tab_training(params: dict) -> None:
         f"factor: <span class='ef-mono'>{params['factor']:.2f}</span></p>"
         f"<p class='ef-muted'>n_components_override: <span class='ef-mono'>{params['n_components_override']}</span> "
         f"(0 = auto dari variance threshold)</p>"
+        f"<p class='ef-muted'>train_ratio: <span class='ef-mono'>{params['train_ratio']:.2f}</span> &nbsp;|&nbsp; "
+        f"hist_eq: <span class='ef-mono'>{params['hist_eq']}</span></p>"
         f"<p class='ef-muted'>X shape: <span class='ef-mono'>{X.shape}</span> &nbsp; dtype={X.dtype}</p>"
     )
     _card("Parameter training", body)
@@ -583,9 +623,31 @@ def tab_training(params: dict) -> None:
     if st.button("Train Eigenfaces", type="primary"):
         try:
             t0 = time.time()
+            X_train = X
+            y_train = y
+
+            # Preprocessing: Histogram Equalization + Z-score
+            if params["hist_eq"]:
+                with st.spinner("Menerapkan Histogram Equalization + Z-score..."):
+                    X_train = ec.preprocess_images(X_train, do_hist_eq=True, do_zscore=True)
+                st.info("Preprocessing selesai: Histogram Equalization + Z-score diterapkan.")
+
+            # Train-Test Split
+            if params["train_ratio"] < 1.0:
+                test_ratio = 1.0 - params["train_ratio"]
+                with st.spinner(f"Membagi dataset ({params['train_ratio']*100:.0f}% train, {test_ratio*100:.0f}% test)..."):
+                    X_train, y_train, X_test, y_test, train_idx, test_idx = ec.train_test_split(
+                        X_train, y, label_names, test_ratio=test_ratio, seed=42
+                    )
+                st.session_state["X_test"] = X_test
+                st.session_state["y_test"] = y_test
+                st.session_state["test_idx"] = test_idx
+                st.session_state["train_idx"] = train_idx
+                st.info(f"Split: {len(train_idx)} train, {len(test_idx)} test")
+
             with st.spinner("Melatih model PCA/SVD (Turk-Pentland dual trick bila N<d)..."):
                 model = cached_fit_eigenfaces(
-                    X,
+                    X_train,
                     params["variance_threshold"],
                     params["whiten"],
                     params["image_size_tuple"],
@@ -593,16 +655,16 @@ def tab_training(params: dict) -> None:
                 )
             elapsed = time.time() - t0
 
-            # Attach train_labels + label_names for downstream use
-            model.train_labels = y
+            model.train_labels = y_train
             model.label_names = label_names
 
-            # Resolve thresholds via vectorized auto-tuning
             euc_thr, cos_thr = ec.resolve_thresholds(
-                model, y, params["metric"], None, None, factor=params["factor"]
+                model, y_train, params["metric"], None, None, factor=params["factor"]
             )
 
             st.session_state["model"] = model
+            st.session_state["X_train"] = X_train
+            st.session_state["y_train"] = y_train
             st.session_state["train_time"] = elapsed
             st.session_state["euc_thr"] = float(euc_thr)
             st.session_state["cos_thr"] = float(cos_thr)
@@ -857,20 +919,13 @@ def tab_identify(params: dict) -> None:
         wq = ec.project_image(model, query_vec)
         match = ec.nearest_neighbor_match(
             wq, model.weights, y, label_names=label_names, metric=metric,
+            euc_thr=euc_thr, cos_thr=cos_thr,
         )
     except Exception as e:
         st.error(f"Proyeksi / matching gagal: {e}")
         return
 
-    # Decision
-    if metric == "euclidean":
-        accept = match["best_euclidean"] <= euc_thr
-        primary_val = match["best_euclidean"]
-        thr = euc_thr
-    else:
-        accept = match["best_cosine"] >= cos_thr
-        primary_val = match["best_cosine"]
-        thr = cos_thr
+    reject = match.get("reject", False)
 
     # Show query + best match
     q_img = ec.vector_to_image(query_vec, params["image_size_tuple"])
@@ -888,8 +943,16 @@ def tab_identify(params: dict) -> None:
               f"<p class='ef-muted'>Nama file: <span class='ef-mono'>{uploaded.name}</span></p>")
         st.image(q_img, caption="Query", use_container_width=True, clamp=True)
     with c2:
-        badge_cls = "same" if accept else "diff"
-        badge_txt = "ACCEPT" if accept else "REJECT"
+        if reject:
+            badge_cls = "diff"
+            badge_txt = "REJECT / UNKNOWN FACE"
+        else:
+            badge_cls = "same"
+            badge_txt = "ACCEPT"
+
+        primary_val = match["best_euclidean"] if metric == "euclidean" else match["best_cosine"]
+        thr = euc_thr if metric == "euclidean" else cos_thr
+
         _card(
             f"Best match — {match['best_label_name']}",
             f"<p class='ef-muted'>Index: <span class='ef-mono'>{best_idx}</span> &nbsp;|&nbsp; "
@@ -1180,6 +1243,66 @@ def tab_evaluate(params: dict) -> None:
         f"<p class='ef-muted'>Total pairs: <span class='ef-mono'>{rep.total}</span> "
         f"(same: {rep.n_same}, diff: {rep.n_diff})</p>",
     )
+
+    # TASK 4: Whiten Comparison
+    st.markdown("---")
+    st.subheader("Analisis Dampak Whiten")
+
+    X_train = st.session_state.get("X_train", st.session_state.get("X"))
+    y_train = st.session_state.get("y_train", st.session_state.get("y"))
+
+    if X_train is not None and y_train is not None:
+        if st.button("Run Whiten Comparison", type="secondary"):
+            try:
+                results = []
+                for whiten_val in [False, True]:
+                    with st.spinner(f"Training dengan whiten={whiten_val}..."):
+                        model_cmp = ec.fit_eigenfaces(
+                            X_train,
+                            variance_threshold=params["variance_threshold"],
+                            image_size=params["image_size_tuple"],
+                            whiten=whiten_val,
+                            dtype=np.float32,
+                            log_mem=False,
+                        )
+
+                    euc_t, cos_t = ec.resolve_thresholds(
+                        model_cmp, y_train, params["metric"], None, None, factor=params["factor"]
+                    )
+
+                    with st.spinner(f"Evaluasi whiten={whiten_val}..."):
+                        rep_cmp = ec.evaluate_gallery(
+                            model_cmp.weights, y_train,
+                            metric=params["metric"],
+                            euclidean_threshold=euc_t,
+                            cosine_threshold=cos_t,
+                            chunk=256,
+                        )
+
+                    results.append({
+                        "Whiten": "ON" if whiten_val else "OFF",
+                        "Accuracy": f"{rep_cmp.accuracy*100:.2f}%",
+                        "Precision": f"{rep_cmp.precision*100:.2f}%",
+                        "Recall": f"{rep_cmp.recall*100:.2f}%",
+                        "F1-Score": f"{rep_cmp.f1*100:.2f}%",
+                        "k Components": model_cmp.eigenfaces.shape[0],
+                    })
+                    del model_cmp, rep_cmp
+                    gc.collect()
+
+                st.session_state["whiten_comparison"] = results
+                st.success("Perbandingan whiten selesai.")
+            except Exception as e:
+                st.error(f"Perbandingan gagal: {e}")
+                import traceback
+                st.expander("Traceback").code(traceback.format_exc())
+
+        comparison = st.session_state.get("whiten_comparison")
+        if comparison:
+            st.markdown("**Perbandingan performa Whiten=True vs Whiten=False:**")
+            st.table(comparison)
+    else:
+        st.info("Data training tidak tersedia. Jalankan training di Tab 2 terlebih dahulu.")
 
     _maybe_gc()
 

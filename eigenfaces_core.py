@@ -285,6 +285,179 @@ def _compute_pca_dual(Phi: np.ndarray):
     return U, S, Vt
 
 
+# --------------------------------------------------------------------------- #
+# Preprocessing: Histogram Equalization + Z-score Normalization
+# --------------------------------------------------------------------------- #
+def histogram_equalization(image_vector: np.ndarray) -> np.ndarray:
+    """Global histogram equalization using cumulative distribution function.
+
+    Menstandardisasi pencahayaan citra agar distribusi intensitas merata.
+    Menggunakan np.cumsum untuk menghitung CDF dari histogram piksel.
+
+    Parameters
+    ----------
+    image_vector : np.ndarray
+        Vektor 1D (flattened image), dtype float32, nilai 0-255.
+
+    Returns
+    -------
+    np.ndarray
+        Vektor hasil equalization, dtype float32, nilai 0-255.
+    """
+    # Konversi ke uint8 untuk histogram
+    img_uint8 = np.clip(image_vector, 0, 255).astype(np.uint8)
+
+    # Hitung histogram dengan 256 bin
+    hist, _ = np.histogram(img_uint8, bins=256, range=(0, 256))
+
+    # Hitung CDF menggunakan np.cumsum
+    cdf = np.cumsum(hist)
+
+    # Normalisasi CDF ke range 0-255
+    cdf_min = cdf[cdf > 0].min() if np.any(cdf > 0) else 0
+    cdf_max = cdf.max()
+
+    if cdf_max - cdf_min > 0:
+        cdf_normalized = ((cdf - cdf_min) / (cdf_max - cdf_min) * 255.0).astype(np.float32)
+    else:
+        cdf_normalized = np.zeros(256, dtype=np.float32)
+
+    # Mapping piksel melalui CDF
+    equalized = cdf_normalized[img_uint8]
+
+    return equalized.astype(np.float32)
+
+
+def z_score_normalize(image_vector: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+    """Z-score normalization per citra: (x - mean) / (std + eps).
+
+    Memstandardisasi citra ke mean=0, std=1.
+
+    Parameters
+    ----------
+    image_vector : np.ndarray
+        Vektor 1D (flattened image), dtype float32.
+    eps : float
+        Epsilon untuk menghindari division by zero.
+
+    Returns
+    -------
+    np.ndarray
+        Vektor ternormalisasi, dtype float32.
+    """
+    img = image_vector.astype(np.float32, copy=False)
+    mu = float(img.mean())
+    sigma = float(img.std())
+    return ((img - mu) / (sigma + eps)).astype(np.float32)
+
+
+def preprocess_images(X: np.ndarray, do_hist_eq: bool = True, do_zscore: bool = True) -> np.ndarray:
+    """Terapkan preprocessing pada matriks citra.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Matriks citra (N, d), dtype float32.
+    do_hist_eq : bool
+        Terapkan histogram equalization.
+    do_zscore : bool
+        Terapkan z-score normalization.
+
+    Returns
+    -------
+    np.ndarray
+        Matriks citra yang sudah dipreprocess, dtype float32.
+    """
+    N = X.shape[0]
+    X_out = np.empty_like(X, dtype=np.float32)
+
+    for i in range(N):
+        img = X[i]
+        if do_hist_eq:
+            img = histogram_equalization(img)
+        if do_zscore:
+            img = z_score_normalize(img)
+        X_out[i] = img
+
+    return X_out
+
+
+# --------------------------------------------------------------------------- #
+# Train-Test Split (proporsional per identitas)
+# --------------------------------------------------------------------------- #
+def train_test_split(
+    X: np.ndarray,
+    y: np.ndarray,
+    label_names: List[str],
+    test_ratio: float = 0.2,
+    seed: int = 42,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split dataset secara proporsional per identitas/label.
+
+    Setiap identitas akan memiliki sampel test sebanyak ceil(len * test_ratio).
+    Pembagian dilakukan secara acak (reproducible) per identitas.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        Matriks citra (N, d).
+    y : np.ndarray
+        Label/identitas (N,).
+    label_names : List[str]
+        Daftar nama identitas.
+    test_ratio : float
+        Rasio data test (0.0 - 1.0).
+    seed : int
+        Random seed untuk reproducibility.
+
+    Returns
+    -------
+    Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+        X_train, y_train, X_test, y_test, train_indices, test_indices
+    """
+    rng = np.random.RandomState(seed)
+    train_indices = []
+    test_indices = []
+
+    unique_labels = np.unique(y)
+
+    for label in unique_labels:
+        # Ambil semua indeks untuk label ini
+        label_indices = np.where(y == label)[0]
+        n_samples = len(label_indices)
+
+        # Hitung jumlah test samples (minimal 1 jika ada cukup data)
+        n_test = max(1, int(np.ceil(n_samples * test_ratio)))
+
+        # Jika hanya 1 sampel, masukkan ke train
+        if n_samples <= 1:
+            train_indices.extend(label_indices.tolist())
+            continue
+
+        # Shuffle indeks untuk label ini
+        rng.shuffle(label_indices)
+
+        # Split
+        test_idx = label_indices[:n_test]
+        train_idx = label_indices[n_test:]
+
+        test_indices.extend(test_idx.tolist())
+        train_indices.extend(train_idx.tolist())
+
+    train_indices = np.array(sorted(train_indices), dtype=np.int64)
+    test_indices = np.array(sorted(test_indices), dtype=np.int64)
+
+    X_train = X[train_indices]
+    y_train = y[train_indices]
+    X_test = X[test_indices]
+    y_test = y[test_indices]
+
+    print(f"[split] train={len(train_indices)} test={len(test_indices)} "
+          f"test_ratio={test_ratio:.2f} seed={seed}")
+
+    return X_train, y_train, X_test, y_test, train_indices, test_indices
+
+
 def fit_eigenfaces(
     X: np.ndarray,
     n_components: Optional[int] = None,
@@ -548,6 +721,8 @@ def nearest_neighbor_match(
     train_labels: np.ndarray,
     label_names: Optional[List[str]] = None,
     metric: str = "euclidean",
+    euc_thr: Optional[float] = None,
+    cos_thr: Optional[float] = None,
 ) -> dict:
     q = query_weight.astype(np.float64, copy=False).reshape(-1)
     TW = train_weights.astype(np.float64, copy=False)
@@ -569,14 +744,24 @@ def nearest_neighbor_match(
     best_label = int(train_labels[best_idx])
     best_label_name = label_names[best_label] if label_names else str(best_label)
 
+    best_euc = float(eucl[best_idx])
+    best_cos = float(coss[best_idx])
+
+    reject = False
+    if metric == "euclidean" and euc_thr is not None:
+        reject = best_euc > euc_thr
+    elif metric == "cosine" and cos_thr is not None:
+        reject = best_cos < cos_thr
+
     return {
         "best_index": best_idx,
         "best_label": best_label,
         "best_label_name": best_label_name,
-        "best_euclidean": float(eucl[best_idx]),
-        "best_cosine": float(coss[best_idx]),
+        "best_euclidean": best_euc,
+        "best_cosine": best_cos,
         "all_euclidean": eucl.astype(np.float32, copy=False),
         "all_cosine": coss.astype(np.float32, copy=False),
+        "reject": reject,
     }
 
 
