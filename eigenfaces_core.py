@@ -1,5 +1,5 @@
 """
-eigenfaces_core.py
+
 ==================
 Pure PCA / SVD Eigenfaces library - NO face-recognition / ML libraries.
 Only depends on numpy (+ optional PIL/cv2 for image I/O, matplotlib for plots).
